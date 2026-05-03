@@ -1,0 +1,50 @@
+name: Tech Digest
+
+on:
+  schedule:
+    # We run at BOTH 23:00 UTC and 00:00 UTC every day to cover Calgary's DST shift:
+    #   - MDT (summer, UTC-6): 5pm Calgary = 23:00 UTC
+    #   - MST (winter, UTC-7): 5pm Calgary = 00:00 UTC (next day)
+    # The script checks the actual local hour in America/Edmonton and only sends
+    # when it's 5pm there, so exactly one email goes out per day year-round.
+    - cron: "0 23 * * *"
+    - cron: "0 0 * * *"
+  workflow_dispatch:  # lets you trigger it manually from the Actions tab (always sends)
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Send digest
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+          # Only send when the local hour in this timezone equals TARGET_HOUR.
+          # Manual workflow_dispatch runs always send (this gate is bypassed).
+          TIMEZONE: "America/Edmonton"
+          TARGET_HOUR: "17"
+
+          # Window of items to include. Once-a-day digest → 24h window.
+          HOURS_WINDOW: "24"
+
+          # Per-source counts. Bumped up since this is a daily digest.
+          HN_COUNT: "15"
+          LOBSTERS_COUNT: "12"
+          DEVTO_COUNT: "10"
+          GITHUB_COUNT: "10"
+          ARXIV_COUNT: "10"
+          ARXIV_CATEGORIES: "cs.AI,cs.LG,cs.CL,cs.SE"
+          # SOURCES: "hn,lobsters,devto,github,arxiv"   # uncomment to disable some
+          # GITHUB_LANGUAGE: "python"                    # uncomment to filter trending
+        run: python digest.py
