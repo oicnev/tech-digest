@@ -45,6 +45,33 @@ jobs:
           GITHUB_COUNT: "10"
           ARXIV_COUNT: "10"
           ARXIV_CATEGORIES: "cs.AI,cs.LG,cs.CL,cs.SE"
-          # SOURCES: "hn,lobsters,devto,github,arxiv"   # uncomment to disable some
-          # GITHUB_LANGUAGE: "python"                    # uncomment to filter trending
+
+          # ---------- Security sources ----------
+          # Both tokens are OPTIONAL — the sources work without them; these only
+          # raise rate limits. NVD_API_KEY resolves to an empty string (and is
+          # ignored) if you haven't created that secret, so it's safe to leave as-is.
+          # GITHUB_TOKEN is provided automatically by Actions; passing it here lifts
+          # the GitHub Advisories rate limit from 60/hr (anonymous) to thousands/hr.
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # CISA KEV — vulnerabilities confirmed exploited in the wild (sparse, so 7-day view).
+          KEV_COUNT: "15"
+          KEV_DAYS: "7"
+          # NVD — newly published CVEs. CRITICAL-only by default; add ",HIGH" for
+          # broader but noisier coverage (HIGH alone can be dozens per day).
+          NVD_COUNT: "15"
+          NVD_SEVERITIES: "CRITICAL"
+          # GitHub Advisories — scoped to your dependency ecosystems.
+          GHSA_COUNT: "12"
+          GHSA_ECOSYSTEMS: "npm,nuget"
+          GHSA_SEVERITIES: "critical,high"
+          GHSA_DAYS: "7"
+          # Security news headlines (RSS).
+          SECNEWS_COUNT: "10"
+
+          # SOURCES default = all of: kev,nvd,ghsa,secnews,hn,lobsters,devto,github,arxiv
+          # Section order in the email follows ALL_SOURCES in digest.py (security first).
+          # SOURCES: "kev,nvd,ghsa,hn,github"   # uncomment to run a subset
+          # GITHUB_LANGUAGE: "python"            # uncomment to filter trending
         run: python digest.py
