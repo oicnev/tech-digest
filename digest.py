@@ -1,5 +1,5 @@
 """
-Multi-source tech news digest.
+Multi-source tech + security digest.
 
 Sources:
   - Hacker News (top stories, official Firebase API)
@@ -7,6 +7,10 @@ Sources:
   - dev.to (top articles, official API)
   - GitHub Trending (HTML scrape — no official API)
   - arXiv (cs.* categories, Atom feed via the export API)
+  - CISA KEV (vulnerabilities CONFIRMED exploited in the wild, official JSON feed)
+  - NVD (newly published CVEs at/above a severity threshold, NVD 2.0 API)
+  - GitHub Security Advisories (scoped to your ecosystems, e.g. npm + NuGet)
+  - Security news (The Hacker News / BleepingComputer / Krebs RSS)
 
 Designed to be run on a schedule via GitHub Actions. Two cron entries fire at
 23:00 and 00:00 UTC; the TIMEZONE/TARGET_HOUR gate makes sure exactly one email
@@ -30,7 +34,22 @@ Optional (all have sensible defaults):
   GITHUB_LANGUAGE    filter trending by language, e.g. "python" (default: all)
   ARXIV_COUNT        how many arXiv papers (default 10)
   ARXIV_CATEGORIES   comma-separated, e.g. "cs.AI,cs.LG,cs.CL" (default: cs.AI,cs.LG,cs.CL,cs.SE)
-  SOURCES            comma-separated subset to enable, e.g. "hn,lobsters" (default: all)
+
+  --- security sources ---
+  KEV_COUNT          how many CISA KEV entries (default 15)
+  KEV_DAYS           KEV entries added in the last N days (default 7 — KEV is sparse)
+  NVD_COUNT          how many NVD CVEs (default 15)
+  NVD_SEVERITIES     comma-separated, CRITICAL/HIGH/MEDIUM/LOW (default: CRITICAL)
+  NVD_API_KEY        optional NVD key for a higher rate limit (not required)
+  GHSA_COUNT         how many GitHub advisories (default 12)
+  GHSA_ECOSYSTEMS    comma-separated, e.g. "npm,nuget,pip" (default: npm,nuget)
+  GHSA_SEVERITIES    comma-separated, critical/high/moderate/low (default: critical,high)
+  GHSA_DAYS          advisories published in the last N days (default 7)
+  GITHUB_TOKEN       optional; raises the GHSA rate limit (auto-provided in Actions)
+  SECNEWS_COUNT      how many security-news headlines (default 10)
+
+  SOURCES            comma-separated subset to enable, e.g. "kev,nvd,hn"
+                     (default: all). Section order in the email follows ALL_SOURCES.
 """
 
 import os
@@ -38,10 +57,11 @@ import re
 import smtplib
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from html import unescape
+from email.utils import parsedate_to_datetime
+from html import unescape, escape
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -50,17 +70,21 @@ import json
 USER_AGENT = "tech-digest-bot/1.0 (personal news digest)"
 
 
-def http_get(url, accept=None, timeout=20):
+def http_get(url, accept=None, timeout=20, extra_headers=None):
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
+    if extra_headers:
+        headers.update(extra_headers)
     req = Request(url, headers=headers)
     with urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def http_get_json(url, timeout=20):
-    return json.loads(http_get(url, accept="application/json", timeout=timeout))
+def http_get_json(url, timeout=20, extra_headers=None):
+    return json.loads(
+        http_get(url, accept="application/json", timeout=timeout, extra_headers=extra_headers)
+    )
 
 
 # ---------- Hacker News ----------
@@ -245,29 +269,246 @@ def fetch_arxiv(count, categories, hours_window):
     return items
 
 
+# ---------- CISA KEV ----------
+# Vulnerabilities CONFIRMED exploited in the wild. Highest-signal source.
+# Plain JSON, no key, no meaningful rate limit.
+
+CISA_KEV_URL = (
+    "https://www.cisa.gov/sites/default/files/feeds/"
+    "known_exploited_vulnerabilities.json"
+)
+
+
+def fetch_cisa_kev(count, days):
+    data = http_get_json(CISA_KEV_URL, timeout=30)
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
+    vulns = data.get("vulnerabilities", [])
+    # The feed isn't guaranteed sorted; sort newest-added first.
+    vulns.sort(key=lambda v: v.get("dateAdded", ""), reverse=True)
+    items = []
+    for v in vulns:
+        if len(items) >= count:
+            break
+        try:
+            added = datetime.strptime(v["dateAdded"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            continue
+        if added < cutoff:
+            continue
+        cve = v.get("cveID", "")
+        detail = f"https://nvd.nist.gov/vuln/detail/{cve}"
+        items.append({
+            "title": f"{cve}: {v.get('vulnerabilityName', '')}",
+            "url": detail,
+            "discussion_url": detail,  # no separate discussion → no "discuss" link
+            "meta": (
+                f"{v.get('vendorProject', '')} {v.get('product', '')} · "
+                f"added {v.get('dateAdded', '')} · patch due {v.get('dueDate', 'n/a')}"
+            ),
+        })
+    return items
+
+
+# ---------- NVD ----------
+# All newly published CVEs at/above a severity threshold (NVD 2.0 API).
+# Free; an optional NVD_API_KEY raises the rate limit.
+
+NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+
+def fetch_nvd(count, severities, hours_window):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours_window)
+    fmt = "%Y-%m-%dT%H:%M:%S.000"
+    api_key = os.environ.get("NVD_API_KEY")
+    extra = {"apiKey": api_key} if api_key else None
+
+    items = []
+    for idx, sev in enumerate(severities):
+        if len(items) >= count:
+            break
+        url = (
+            NVD_API
+            + f"?pubStartDate={quote(start.strftime(fmt))}"
+            + f"&pubEndDate={quote(end.strftime(fmt))}"
+            + f"&cvssV3Severity={sev}"
+            + "&resultsPerPage=200"
+        )
+        try:
+            data = http_get_json(url, timeout=30, extra_headers=extra)
+        except Exception:
+            # NVD occasionally rate-limits or times out; skip this severity.
+            continue
+        for entry in data.get("vulnerabilities", []):
+            if len(items) >= count:
+                break
+            cve = entry.get("cve", {})
+            cve_id = cve.get("id", "")
+            descs = cve.get("descriptions", [])
+            desc = next((d.get("value", "") for d in descs if d.get("lang") == "en"), "")
+            if len(desc) > 160:
+                desc = desc[:160].rstrip() + "…"
+            detail = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+            items.append({
+                "title": f"{cve_id} [{sev}]",
+                "url": detail,
+                "discussion_url": detail,
+                "meta": desc,
+            })
+        # Be polite to NVD between severity requests (one request needs no wait).
+        if idx < len(severities) - 1:
+            time.sleep(0.6 if api_key else 6)
+    return items
+
+
+# ---------- GitHub Security Advisories ----------
+# Scoped to the package ecosystems you actually depend on.
+
+GHSA_API = "https://api.github.com/advisories"
+
+
+def fetch_github_advisories(count, ecosystems, severities, days):
+    token = os.environ.get("GITHUB_TOKEN")
+    extra = {"Accept": "application/vnd.github+json"}
+    if token:
+        extra["Authorization"] = f"Bearer {token}"
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    items = []
+    for eco in ecosystems:
+        for sev in severities:
+            if len(items) >= count:
+                break
+            url = (
+                f"{GHSA_API}?ecosystem={quote(eco)}&severity={quote(sev)}"
+                "&sort=published&direction=desc&per_page=50"
+            )
+            try:
+                advs = http_get_json(url, timeout=30, extra_headers=extra)
+            except Exception:
+                continue
+            for adv in advs:
+                if len(items) >= count:
+                    break
+                published = adv.get("published_at")
+                if published:
+                    try:
+                        pub = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                        if pub < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                ghsa = adv.get("ghsa_id", "")
+                summary = adv.get("summary", "") or ghsa
+                cve = adv.get("cve_id") or ""
+                items.append({
+                    "title": f"[{eco}] {summary}",
+                    "url": adv.get("html_url", ""),
+                    "discussion_url": adv.get("html_url", ""),
+                    "meta": " · ".join(p for p in [ghsa, cve, sev] if p),
+                })
+    return items
+
+
+# ---------- Security news (RSS) ----------
+
+SECURITY_FEEDS = [
+    ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
+    ("BleepingComputer", "https://www.bleepingcomputer.com/feed/"),
+    ("Krebs on Security", "https://krebsonsecurity.com/feed/"),
+]
+
+
+def _strip_cdata(s):
+    s = s.strip()
+    m = re.match(r"^<!\[CDATA\[(.*?)\]\]>$", s, re.DOTALL)
+    return m.group(1).strip() if m else s
+
+
+def fetch_security_news(count, hours_window):
+    cutoff = time.time() - (hours_window * 3600)
+    per_feed = max(3, count // max(1, len(SECURITY_FEEDS)) + 1)
+    items = []
+    for source_name, feed_url in SECURITY_FEEDS:
+        if len(items) >= count:
+            break
+        try:
+            xml = http_get(feed_url, accept="application/rss+xml")
+        except Exception:
+            continue
+        entries = re.findall(r"<item(?:\s[^>]*)?>(.*?)</item>", xml, re.DOTALL)
+        added = 0
+        for entry in entries:
+            if added >= per_feed or len(items) >= count:
+                break
+            title_m = re.search(r"<title>(.*?)</title>", entry, re.DOTALL)
+            link_m = re.search(r"<link>(.*?)</link>", entry, re.DOTALL)
+            date_m = re.search(r"<pubDate>(.*?)</pubDate>", entry, re.DOTALL)
+            if not title_m:
+                continue
+            link = _strip_cdata(link_m.group(1)).strip() if link_m else ""
+            if not link:  # Atom-style <link href="..."/> fallback
+                alink = re.search(r'<link[^>]*href="([^"]+)"', entry)
+                link = alink.group(1).strip() if alink else ""
+            if not link:  # last resort: <guid>
+                guid_m = re.search(r"<guid[^>]*>(.*?)</guid>", entry, re.DOTALL)
+                link = _strip_cdata(guid_m.group(1)).strip() if guid_m else ""
+            if not link:
+                continue
+            published = 0
+            if date_m:
+                try:
+                    published = parsedate_to_datetime(date_m.group(1).strip()).timestamp()
+                except Exception:
+                    published = 0
+            if published and published < cutoff:
+                continue
+            title = unescape(_strip_cdata(re.sub(r"\s+", " ", title_m.group(1))).strip())
+            items.append({
+                "title": title,
+                "url": link,
+                "discussion_url": link,
+                "meta": source_name,
+            })
+            added += 1
+    return items
+
+
 # ---------- Rendering ----------
+
+# Security sections get a red accent so vulnerabilities stand out from tech news.
+SECURITY_SECTION_NAMES = {
+    "Actively Exploited — CISA KEV",
+    "New CVEs — NVD",
+    "Dependency Advisories — npm + NuGet",
+    "Security News",
+}
+
 
 def render_section_html(name, items):
     if not items:
         return ""
+    accent = "#c8102e" if name in SECURITY_SECTION_NAMES else "#ff6600"
     rows = []
     for i, it in enumerate(items, start=1):
         discuss_link = ""
         if it.get("discussion_url") and it["discussion_url"] != it["url"]:
             discuss_link = f' · <a href="{it["discussion_url"]}" style="color:#888;">discuss</a>'
+        title = escape(it["title"])
+        meta = escape(it["meta"])
         rows.append(f"""
         <tr>
           <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top;width:24px;">
             <div style="font-size:13px;color:#888;">{i}.</div>
           </td>
           <td style="padding:10px 8px;border-bottom:1px solid #eee;">
-            <a href="{it['url']}" style="color:#000;text-decoration:none;font-weight:600;font-size:15px;">{it['title']}</a>
-            <div style="color:#888;font-size:12px;margin-top:4px;">{it['meta']}{discuss_link}</div>
+            <a href="{it['url']}" style="color:#000;text-decoration:none;font-weight:600;font-size:15px;">{title}</a>
+            <div style="color:#888;font-size:12px;margin-top:4px;">{meta}{discuss_link}</div>
           </td>
         </tr>
         """)
     return f"""
-      <h3 style="margin-top:28px;margin-bottom:4px;font-size:14px;text-transform:uppercase;letter-spacing:0.5px;color:#ff6600;">{name}</h3>
+      <h3 style="margin-top:28px;margin-bottom:4px;font-size:14px;text-transform:uppercase;letter-spacing:0.5px;color:{accent};">{escape(name)}</h3>
       <table style="width:100%;border-collapse:collapse;">{''.join(rows)}</table>
     """
 
@@ -276,7 +517,7 @@ def render_html(sections, local_now_str):
     body = "".join(render_section_html(name, items) for name, items in sections)
     return f"""
     <html><body style="font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:0 auto;padding:20px;">
-      <h2 style="border-bottom:2px solid #ff6600;padding-bottom:8px;margin-bottom:0;">Daily Tech Digest</h2>
+      <h2 style="border-bottom:2px solid #ff6600;padding-bottom:8px;margin-bottom:0;">Daily Tech &amp; Security Digest</h2>
       <div style="color:#888;font-size:12px;margin-top:4px;">{local_now_str}</div>
       {body}
       <p style="color:#aaa;font-size:11px;margin-top:32px;">Auto-generated digest.</p>
@@ -285,7 +526,7 @@ def render_html(sections, local_now_str):
 
 
 def render_text(sections):
-    out = ["Daily Tech Digest", "=" * 40, ""]
+    out = ["Daily Tech & Security Digest", "=" * 40, ""]
     for name, items in sections:
         if not items:
             continue
@@ -324,7 +565,10 @@ def send_email(subject, html, text):
 
 # ---------- Orchestration ----------
 
-ALL_SOURCES = ["hn", "lobsters", "devto", "github", "arxiv"]
+# Section order in the email follows this list. Security sources lead so the
+# most actionable items (actively-exploited CVEs) are seen first — reorder
+# freely, e.g. move "hn" to the front to keep the old tech-first layout.
+ALL_SOURCES = ["kev", "nvd", "ghsa", "secnews", "hn", "lobsters", "devto", "github", "arxiv"]
 
 
 def should_send_now():
@@ -376,6 +620,25 @@ def main():
             os.environ.get("ARXIV_CATEGORIES", "cs.AI,cs.LG,cs.CL,cs.SE").split(","),
             hours,
         )),
+        "kev": ("Actively Exploited — CISA KEV", lambda: fetch_cisa_kev(
+            int(os.environ.get("KEV_COUNT", "15")),
+            int(os.environ.get("KEV_DAYS", "7")),
+        )),
+        "nvd": ("New CVEs — NVD", lambda: fetch_nvd(
+            int(os.environ.get("NVD_COUNT", "15")),
+            [s.strip().upper() for s in os.environ.get("NVD_SEVERITIES", "CRITICAL").split(",") if s.strip()],
+            hours,
+        )),
+        "ghsa": ("Dependency Advisories — npm + NuGet", lambda: fetch_github_advisories(
+            int(os.environ.get("GHSA_COUNT", "12")),
+            [s.strip() for s in os.environ.get("GHSA_ECOSYSTEMS", "npm,nuget").split(",") if s.strip()],
+            [s.strip().lower() for s in os.environ.get("GHSA_SEVERITIES", "critical,high").split(",") if s.strip()],
+            int(os.environ.get("GHSA_DAYS", "7")),
+        )),
+        "secnews": ("Security News", lambda: fetch_security_news(
+            int(os.environ.get("SECNEWS_COUNT", "10")),
+            hours,
+        )),
     }
 
     sections = []
@@ -397,7 +660,7 @@ def main():
         print("No items from any source — skipping email.")
         return
 
-    subject = f"Daily Tech Digest — {total} items"
+    subject = f"Daily Tech & Security Digest — {total} items"
     send_email(subject, render_html(sections, local_str), render_text(sections))
     print(f"Sent digest with {total} items.")
 
